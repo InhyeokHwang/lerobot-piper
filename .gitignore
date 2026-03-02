@@ -3,6 +3,7 @@ __pycache__/
 /quest3/__pycache__/
 /lerobot_mujoco/bimanual/__pycache__/
 /mink_ik/__pycache__/
+/ckpt/
 
 # Quest3 TLS certs 
 quest3/cert.pem
