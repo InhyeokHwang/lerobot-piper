@@ -4,6 +4,8 @@ __pycache__/
 /lerobot_mujoco/bimanual/__pycache__/
 /mink_ik/__pycache__/
 /ckpt/
+/lerobot_mujoco/single_arm/demo_data/
+/lerobot_mujoco/bimanual/demo_data/
 
 # Quest3 TLS certs 
 quest3/cert.pem
