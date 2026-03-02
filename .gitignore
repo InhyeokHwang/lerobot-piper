@@ -13,3 +13,7 @@ quest3/key.pem
 # checkpoints
 ckpt/
 *.safetensors
+
+# checkpoints
+ckpt/
+*.safetensors
