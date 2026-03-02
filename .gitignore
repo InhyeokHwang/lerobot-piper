@@ -10,10 +10,3 @@ __pycache__/
 # Quest3 TLS certs 
 quest3/cert.pem
 quest3/key.pem
-# checkpoints
-ckpt/
-*.safetensors
-
-# checkpoints
-ckpt/
-*.safetensors

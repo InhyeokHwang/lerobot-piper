@@ -165,7 +165,7 @@ class PiperFollower(Robot):
 
     @check_if_not_connected
     def disconnect(self) -> None:
-        self.bus.disconnect(getattr(self.config, "disable_torque_on_disconnect", True))
+        self.bus.disconnect(getattr(self.config, "disable_torque_on_disconnect", False))
         for cam in self.cameras.values():
             cam.disconnect()
         logger.info(f"{self} disconnected.")

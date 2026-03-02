@@ -85,7 +85,7 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
 
     if create_new:
         features = {
-            "observation.image": { # agent view
+            "observation.front_image": { # front cam
                 "dtype": "image",                 
                 "shape": (256, 256, 3),
                 "names": ["height", "width", "channels"],
@@ -109,7 +109,7 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
                 "dtype": "float32",
                 "shape": (model.nq,),  # qpos
                 "names": ["qpos"],
-            },
+            }
         }
 
         dataset = LeRobotDataset.create(
@@ -244,7 +244,7 @@ def main():
             mujoco.mjv_defaultFreeCamera(model, viewer.cam)
             renderer = mujoco.Renderer(model, height=IMG_H, width=IMG_W)
 
-            last_agent_rgb = None
+            last_front_rgb = None
             last_wrist_rgb = None
 
             latest = {"frame": None}
@@ -334,13 +334,13 @@ def main():
 
                     # camera agent view
                     renderer.update_scene(data, camera=AGENT_CAM)
-                    agent_rgb = np.ascontiguousarray(renderer.render().copy())
+                    front_rgb = np.ascontiguousarray(renderer.render().copy())
 
                     # camera wrist view
                     renderer.update_scene(data, camera=WRIST_CAM)
                     wrist_rgb = np.ascontiguousarray(renderer.render().copy())
 
-                    last_agent_rgb = agent_rgb
+                    last_front_rgb = front_rgb
                     last_wrist_rgb = wrist_rgb
                     
                     if record_flag:
@@ -356,13 +356,12 @@ def main():
                             "observation.target": target_state,
                             "action": action_qpos,
                             "task": TASK_NAME,   
+                            "observation.front_image": front_rgb,
+                            "observation.wrist_image": wrist_rgb,
                         }
 
-                        frame_dict["observation.image"] = agent_rgb
-                        frame_dict["observation.wrist_image"] = wrist_rgb
-
                         dataset.add_frame(frame_dict)
-                    draw_rgb_panels_on_viewer(viewer, last_agent_rgb, last_wrist_rgb) # camera
+                    draw_rgb_panels_on_viewer(viewer, last_front_rgb, last_wrist_rgb) # camera
                 # ---------------------------------------
 
                 viewer.sync()

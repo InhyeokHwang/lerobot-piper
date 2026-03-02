@@ -1,20 +1,18 @@
 {
     "codebase_version": "v3.0",
     "robot_type": "mujoco",
-    "total_episodes": 2,
-    "total_frames": 202,
-    "total_tasks": 1,
+    "total_episodes": 0,
+    "total_frames": 0,
+    "total_tasks": 0,
     "chunks_size": 1000,
     "data_files_size_in_mb": 100,
     "video_files_size_in_mb": 200,
     "fps": 20,
-    "splits": {
-        "train": "0:2"
-    },
+    "splits": {},
     "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
     "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4",
     "features": {
-        "observation.image": {
+        "observation.front_image": {
             "dtype": "image",
             "shape": [
                 256,
