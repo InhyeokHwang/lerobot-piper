@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict
+import threading
+import time
 
 import mujoco
 import mujoco.viewer
@@ -9,15 +11,19 @@ import numpy as np
 from loop_rate_limiters import RateLimiter
 import mink
 
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
 from quest3.quest3_teleop import Quest3Teleop
 
+from camera_utils.camera_renderer import draw_rgb_panels_on_viewer
+
 from mink_ik.single_arm_mink_ik import (
-    pick_ee_site,                     
-    site_pose,                       
-    check_reached_single,             
-    initialize_model,                 
-    build_ctrl_map_for_joints,       
-    apply_configuration,             
+    pick_ee_site,
+    site_pose,
+    check_reached_single,
+    initialize_model,
+    build_ctrl_map_for_joints,
+    apply_configuration,
 )
 
 from mink_ik.quest3_utils import (
@@ -41,7 +47,7 @@ POS_THRESHOLD = 1e-4
 ORI_THRESHOLD = 1e-4
 
 # Viewer loop rate
-RATE_HZ = 100.0
+RATE_HZ = 50.0
 
 # Data collection rate
 REC_HZ = 20.0
@@ -52,58 +58,86 @@ R_SWAP_XZ = np.array([
     [0.0, 0.0, 1.0],
     [0.0,-1.0, 0.0],
     [1.0, 0.0, 0.0],
-], dtype=np.float64) 
+], dtype=np.float64)
 
 # 부호 교정
 R_FLIP_RP = np.array([
     [-1.0,  0.0,  0.0],
-    [ 0.0, 1.0,  0.0],
+    [ 0.0,  1.0,  0.0],
     [ 0.0,  0.0,  1.0],
-], dtype=np.float64)  # = Rz(pi), det=+1
+], dtype=np.float64)
 
+REPO_ID = "piper_single_arm_teleop"
+DATASET_HOME = (_HERE / "demo_data").resolve()     
+FPS = int(REC_HZ)
 
-class EpisodeDataset:
-    def __init__(self, out_dir: Path):
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        # frame = episode buffer
-        self._frames: List[Dict] = [] # observation.state, observation.target, action.qpos, task
-        self._episode_idx = 0
+IMG_H, IMG_W = 256, 256
+AGENT_CAM = "agentview"
+WRIST_CAM = "wrist_cam"
 
-    def add_frame(self, frame: Dict, task: str):
-        frame = dict(frame)
-        frame["task"] = task
-        self._frames.append(frame)
-
-    def clear_episode_buffer(self):
-        self._frames.clear()
-
-    def save_episode(self):
-        if len(self._frames) == 0:
-            print("[DATASET] skip save (empty episode)")
-            return
-
-        ep_path = self.out_dir / f"episode_{self._episode_idx:04d}.npz"
-        # npz compress
-        np.savez_compressed(ep_path, frames=np.array(self._frames, dtype=object))
-        print(f"[DATASET] saved: {ep_path} (frames={len(self._frames)})")
-
-        self._episode_idx += 1
-        self._frames.clear()
-
-def get_obs_state(model: mujoco.MjModel, data: mujoco.MjData, site_id: int) -> np.ndarray:
-    pos, quat = site_pose(model, data, site_id) # 3 4
-    return np.concatenate([pos, quat], axis=0)
 
 def _vec1(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
+
+def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
+    dataset_root = DATASET_HOME / REPO_ID
+    create_new = not (dataset_root / "meta").exists()
+
+    if create_new:
+        features = {
+            "observation.image": { # agent view
+                "dtype": "image",                 
+                "shape": (256, 256, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.wrist_image": { # wrist cam
+                "dtype": "image",
+                "shape": (256, 256, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (7,),  # pos(3)+quat(4)
+                "names": ["state"],
+            },
+            "observation.target": {
+                "dtype": "float32",
+                "shape": (7,),  # target pos(3)+quat(4)
+                "names": ["target"],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (model.nq,),  # qpos
+                "names": ["qpos"],
+            },
+        }
+
+        dataset = LeRobotDataset.create(
+            repo_id=REPO_ID,
+            root=str(DATASET_HOME),     
+            robot_type="mujoco",
+            fps=FPS,
+            features=features,
+        )
+        print(f"[DATASET] created at: {dataset_root}")
+    else:
+        dataset = LeRobotDataset(REPO_ID, root=str(DATASET_HOME))
+        print(f"[DATASET] loaded from: {dataset_root}")
+
+    return dataset
+
+
+def get_obs_state(model: mujoco.MjModel, data: mujoco.MjData, site_id: int) -> np.ndarray:
+    pos, quat = site_pose(model, data, site_id)
+    return np.concatenate([pos, quat], axis=0)  # (7,)
+
 
 def gripper_step(
     *, model: mujoco.MjModel, data: mujoco.MjData, cmd: float, state: Dict,
     init: bool = False, act_name: str = "gripper"
 ) -> None:
     gripper_value = float(np.clip(cmd, 0.0, 1.0))
-    gripper_value = 1.0 - gripper_value # invert
+    gripper_value = 1.0 - gripper_value  # invert
 
     if init or ("act_id" not in state):
         state["act_id"] = model.actuator(act_name).id
@@ -116,17 +150,24 @@ def gripper_step(
     high = float(state["high"])
     data.ctrl[act_id] = low + (high - low) * gripper_value
 
-def main():
-    # dataset setup 
-    TASK_NAME = "piper_single_arm_teleop"
-    NUM_DEMO = 50
-    dataset = EpisodeDataset(out_dir=_HERE / "dataset_out")
 
-    # Quest3 input
+def main():
+    TASK_NAME = REPO_ID
+    NUM_DEMO = 50
+
     teleop = Quest3Teleop()
 
-    # MuJoCo model for FK/IK internal representation
     model, data, configuration = initialize_model()
+    dataset = make_or_load_dataset(model=model)
+
+    def require_camera(name: str):
+        cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, name)
+        if cam_id == -1:
+            raise RuntimeError(f"Camera '{name}' not found in model. Check XML include/name.")
+        return cam_id
+
+    require_camera(AGENT_CAM)
+    require_camera(WRIST_CAM)
 
     # initial pose
     key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -144,7 +185,7 @@ def main():
     if site_id < 0:
         raise RuntimeError(f"EE site not found in model: {ee_site}")
 
-    # IK tasks 
+    # IK tasks
     ee_task = mink.FrameTask(
         frame_name=ee_site,
         frame_type="site",
@@ -156,30 +197,27 @@ def main():
     tasks = [ee_task, posture_task]
     posture_task.set_target_from_configuration(configuration)
 
-    # joint -> actuator
     joint2act = build_ctrl_map_for_joints(model)
 
-    # gripper setup
-    grip_state: Dict = {} #cache
-    gripper_step(model=model, data=data, cmd=0.0, state=grip_state, init=True) # 캐시 초기화는 처음만
+    # gripper init
+    grip_state: Dict = {}
+    gripper_step(model=model, data=data, cmd=0.0, state=grip_state, init=True)
 
-    # init mocap target to current EE
+    # init mocap target
     mink.move_mocap_to_frame(model, data, "target", ee_site, "site")
     mujoco.mj_forward(model, data)
 
-    # timing
     rate = RateLimiter(frequency=RATE_HZ, warn=False)
     rec_accum = 0.0
 
-    # right controller only
     follow = Controller(use_rotation=True, pos_scale=1.0, R_fix=np.eye(3))
 
-    # episode logic
     episode_id = 0
     record_flag = False
 
     def hard_reset():
         nonlocal record_flag, follow, grip_state
+
         if key_id != -1:
             mujoco.mj_resetDataKeyframe(model, data, key_id)
         else:
@@ -189,6 +227,7 @@ def main():
 
         posture_task.set_target_from_configuration(configuration)
         gripper_step(model=model, data=data, cmd=0.0, state=grip_state, init=False)
+
         mink.move_mocap_to_frame(model, data, "target", ee_site, "site")
         mujoco.mj_forward(model, data)
 
@@ -200,123 +239,139 @@ def main():
     prev_reset = False
     prev_done = False
 
-    # loop
-    with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=False) as viewer:
-        mujoco.mjv_defaultFreeCamera(model, viewer.cam)
+    try:
+        with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=True) as viewer:
+            mujoco.mjv_defaultFreeCamera(model, viewer.cam)
+            renderer = mujoco.Renderer(model, height=IMG_H, width=IMG_W)
 
-        while viewer.is_running() and episode_id < NUM_DEMO:
-            frame_dt = rate.dt # 0.01s
-            ik_dt = frame_dt / MAX_ITERS_PER_CYCLE # 0.0005s
+            last_agent_rgb = None
+            last_wrist_rgb = None
 
-            # controller input
-            frame = teleop.read()
+            latest = {"frame": None}
+            stop_event = threading.Event()
+            def teleop_thread():
+                while not stop_event.is_set():
+                    latest["frame"] = teleop.read()
+                    time.sleep(0.01)  
+            th = threading.Thread(target=teleop_thread, daemon=True)
+            th.start()
 
-            # gripper
-            grip_cmd = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
+            while viewer.is_running() and episode_id < NUM_DEMO:
+                frame = latest["frame"] # teleop frame
+                if frame is None:
+                    rate.sleep()
+                    continue
+                
+                frame_dt = rate.dt
+                ik_dt = frame_dt / MAX_ITERS_PER_CYCLE
 
-            # controller 4x4 homogeneous transform
-            T_ctrl = T_from_pos_quat_xyzw(frame.right_pose.pos, frame.right_pose.quat)
-            T_ctrl[:3,:3] = T_ctrl[:3,:3] @ (R_FLIP_RP @ R_SWAP_XZ)
-            
-            # mocap
-            mocap_id = model.body("target").mocapid
+                # gripper
+                grip_cmd = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
 
-            # mocap 4x4 homogeneous transform
-            T_moc_now = T_from_mocap(model, data, mocap_id)
+                # controller pose
+                T_ctrl = T_from_pos_quat_xyzw(frame.right_pose.pos, frame.right_pose.quat)
+                T_ctrl[:3, :3] = T_ctrl[:3, :3] @ (R_FLIP_RP @ R_SWAP_XZ)
 
-            # controller delta
-            ok, T_des = follow.update(frame.right_state.squeeze, T_ctrl, T_moc_now)
-            if ok and T_des is not None:
-                set_mocap_from_T(data, mocap_id, T_des)
+                mocap_id = model.body("target").mocapid
+                T_moc_now = T_from_mocap(model, data, mocap_id)
 
-            # record start condition: mocap being updated
-            if (not record_flag) and ok:
-                record_flag = True
-                print("[DATASET] Start recording")
+                ok, T_des = follow.update(frame.right_state.squeeze, T_ctrl, T_moc_now)
+                if ok and T_des is not None:
+                    set_mocap_from_T(data, mocap_id, T_des)
 
-            # reset: right controller button B
-            reset_now = bool(frame.right_state.button1)
-            reset = reset_now and (not prev_reset)
-            prev_reset = reset_now
-            if reset:
-                hard_reset()
-                viewer.sync()
-                rate.sleep()
-                continue
+                if (not record_flag) and ok:
+                    record_flag = True
+                    print("[DATASET] Start recording")
 
-            # done: right controller button A
-            done_now = bool(frame.right_state.button0)
-            done = done_now and (not prev_done)
-            prev_done = done_now
+                # reset (B)
+                reset_now = bool(frame.right_state.button1)
+                reset = reset_now and (not prev_reset)
+                prev_reset = reset_now
+                if reset:
+                    hard_reset()
+                    viewer.sync()
+                    rate.sleep()
+                    continue
 
-            if done:
-                print(f"[DONE] button A pressed. record_flag={record_flag} frames={len(dataset._frames)}")
-                if record_flag:
-                    dataset.save_episode()
-                    episode_id += 1
-                    print(f"[DATASET] Episode done. episode_id={episode_id}/{NUM_DEMO}")
-                hard_reset()
-                continue
+                # done (A)
+                done_now = bool(frame.right_state.button0)
+                done = done_now and (not prev_done)
+                prev_done = done_now
+                if done:
+                    print(f"[DONE] button A pressed. record_flag={record_flag}")
+                    if record_flag:
+                        dataset.save_episode()
+                        episode_id += 1
+                        print(f"[DATASET] Episode done. episode_id={episode_id}/{NUM_DEMO}")
+                    hard_reset()
+                    continue
 
-            # set mocap to IK task target
-            ee_task.set_target(mink.SE3.from_mocap_name(model, data, "target"))
+                # IK target
+                ee_task.set_target(mink.SE3.from_mocap_name(model, data, "target"))
+                target_pos = data.mocap_pos[mocap_id].copy()
+                target_quat = data.mocap_quat[mocap_id].copy()
 
-            # copy current targets (to check reached)
-            target_pos = data.mocap_pos[mocap_id].copy()
-            target_quat = data.mocap_quat[mocap_id].copy()
+                for _ in range(MAX_ITERS_PER_CYCLE):
+                    vel = mink.solve_ik(configuration, tasks, ik_dt, SOLVER, DAMPING)
+                    configuration.integrate_inplace(vel, ik_dt)
 
-            # IK sub-iterations
-            reached = False
-            for _ in range(MAX_ITERS_PER_CYCLE):
-                vel = mink.solve_ik(configuration, tasks, ik_dt, SOLVER, DAMPING)
-                configuration.integrate_inplace(vel, ik_dt)
+                    apply_configuration(model, data, configuration, joint2act=joint2act)
+                    gripper_step(model=model, data=data, cmd=grip_cmd, state=grip_state, init=False)
+                    mujoco.mj_step(model, data)
 
-                apply_configuration(model, data, configuration, joint2act=joint2act)
+                    reached = check_reached_single(
+                        model, data, site_id,
+                        target_pos, target_quat,
+                        POS_THRESHOLD, ORI_THRESHOLD,
+                    )
+                    if reached:
+                        break
 
-                # gripper ctrl 
-                gripper_step(model=model, data=data, cmd=grip_cmd, state=grip_state, init=False)
+                # -------- data collection --------
+                rec_accum += frame_dt
+                if rec_accum >= REC_DT:
+                    rec_accum -= REC_DT
 
-                mujoco.mj_step(model, data)
+                    # camera agent view
+                    renderer.update_scene(data, camera=AGENT_CAM)
+                    agent_rgb = np.ascontiguousarray(renderer.render().copy())
 
-                reached = check_reached_single(
-                    model, data,
-                    site_id,
-                    target_pos, target_quat,
-                    POS_THRESHOLD, ORI_THRESHOLD,
-                )
-                if reached:
-                    break
+                    # camera wrist view
+                    renderer.update_scene(data, camera=WRIST_CAM)
+                    wrist_rgb = np.ascontiguousarray(renderer.render().copy())
 
-            # --------------- data collection ---------------
-            rec_accum += frame_dt
-            if rec_accum >= REC_DT:
-                rec_accum -= REC_DT
+                    last_agent_rgb = agent_rgb
+                    last_wrist_rgb = wrist_rgb
+                    
+                    if record_flag:
+                        obs_state = get_obs_state(model, data, site_id).astype(np.float32)
+                        action_qpos = data.qpos.copy().astype(np.float32)
 
-                # observation
-                obs_state = get_obs_state(model, data, site_id)  # (7,)
+                        tpos = _vec1(data.mocap_pos[mocap_id])[:3]
+                        tquat = _vec1(data.mocap_quat[mocap_id])[:4]
+                        target_state = np.concatenate([tpos, tquat], axis=0).astype(np.float32)
 
-                # action label: current qpos
-                action_qpos = data.qpos.copy()
-
-                # target (mocap) pose
-                tpos = _vec1(data.mocap_pos[mocap_id])[:3]
-                tquat = _vec1(data.mocap_quat[mocap_id])[:4]
-                target_state = np.concatenate([tpos, tquat], axis=0)  # (7,)
-
-                if record_flag:
-                    dataset.add_frame(
-                        {
+                        frame_dict = {
                             "observation.state": obs_state,
                             "observation.target": target_state,
-                            "action.qpos": action_qpos,
-                        },
-                        task=TASK_NAME,
-                    )
-            # ----------------------------------------------------
+                            "action": action_qpos,
+                            "task": TASK_NAME,   
+                        }
 
-            viewer.sync()
-            rate.sleep()
+                        frame_dict["observation.image"] = agent_rgb
+                        frame_dict["observation.wrist_image"] = wrist_rgb
 
+                        dataset.add_frame(frame_dict)
+                    draw_rgb_panels_on_viewer(viewer, last_agent_rgb, last_wrist_rgb) # camera
+                # ---------------------------------------
+
+                viewer.sync()
+                rate.sleep()
+
+    finally:
+        stop_event.set()
+        dataset.finalize()
+        print("[DATASET] finalize() done")
 
 if __name__ == "__main__":
     main()

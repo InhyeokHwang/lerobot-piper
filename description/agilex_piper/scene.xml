@@ -19,5 +19,6 @@
   <worldbody>
     <light pos="0 0 1.5" dir="0 0 -1" directional="true"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+    <camera name="agentview" pos="1.0 0.0 0.4" quat="0.9239 0 0.3827 0" fovy="60"/> <!-- camera fixed in world -->
   </worldbody>
 </mujoco>

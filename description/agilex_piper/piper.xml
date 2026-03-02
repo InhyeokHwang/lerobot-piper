@@ -222,6 +222,15 @@
                 <geom mesh="link5" class="collision"/>
                 <body name="link6" pos="0 0.091 0.0014165" quat="0 0 -0.707105 -0.707108" gravcomp="1">
                   <site name="gripper" pos="0 0 0.14"/> <!-- 이 부분 site 추가 -->
+                  <body name="wrist_cam" pos="0 0 0.10"> <!-- wrist cam 추가-->
+                    <geom type="box" size="0.005 0.005 0.005"
+                          contype="0" conaffinity="0"
+                          rgba="1 0 0 0" />
+                    <camera name="wrist_cam"
+                            pos="0 0 0"
+                            xyaxes="-1 0 0  0 0 1"
+                            fovy="90" />
+                  </body>
                   <inertial pos="0.0010312 0.0121761 0.0315481" quat="0.0230402 0.707091 0.0373344 0.70576" mass="1.2"
                     diaginertia="0.001 0.001 0.001"/>
                   <joint name="joint6" axis="0 0 1" range="-3.14 3.14"/>

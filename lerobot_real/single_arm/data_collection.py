@@ -9,6 +9,8 @@ import mujoco
 import mink
 from loop_rate_limiters import RateLimiter
 
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
 from quest3.quest3_teleop import Quest3Teleop
 
 from mink_ik.single_arm_mink_ik import (
@@ -70,34 +72,57 @@ R_FLIP_RP = np.array([
     [ 0.0,  0.0,  1.0],
 ], dtype=np.float64)  # = Rz(pi), det=+1
 
-class EpisodeDataset:
-    def __init__(self, out_dir: Path):
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-        # frame = episode buffer
-        self._frames: List[Dict] = [] # observation.state, observation.target, action.qpos, task
-        self._episode_idx = 0
+REPO_ID = "piper_single_arm_teleop"
+DATASET_HOME = (_HERE / "demo_data").resolve()     
+FPS = int(REC_HZ)
 
-    def add_frame(self, frame: Dict, task: str):
-        fr = dict(frame)
-        fr["task"] = task
-        self._frames.append(fr)
+def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
+    dataset_root = DATASET_HOME / REPO_ID
+    create_new = not (dataset_root / "meta").exists()
 
-    def clear_episode_buffer(self):
-        self._frames.clear()
+    if create_new:
+        features = {
+            "observation.image": { # agent view
+                "dtype": "image",                 
+                "shape": (256, 256, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.wrist_image": { # wrist cam
+                "dtype": "image",
+                "shape": (256, 256, 3),
+                "names": ["height", "width", "channels"],
+            },
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (7,),  # pos(3)+quat(4)
+                "names": ["state"],
+            },
+            "observation.target": {
+                "dtype": "float32",
+                "shape": (7,),  # target pos(3)+quat(4)
+                "names": ["target"],
+            },
+            "action": {
+                "dtype": "float32",
+                "shape": (model.nq,),  # qpos
+                "names": ["qpos"],
+            },
+        }
 
-    def save_episode(self):
-        if len(self._frames) == 0:
-            print("[DATASET] skip save (empty episode)")
-            return
-        
-        ep_path = self.out_dir / f"episode_{self._episode_idx:04d}.npz"
-        # npz compress
-        np.savez_compressed(ep_path, frames=np.array(self._frames, dtype=object))
-        print(f"[DATASET] saved: {ep_path} (frames={len(self._frames)})")
+        dataset = LeRobotDataset.create(
+            repo_id=REPO_ID,
+            root=str(DATASET_HOME),     
+            robot_type="mujoco",
+            fps=FPS,
+            features=features,
+        )
+        print(f"[DATASET] created at: {dataset_root}")
+    else:
+        dataset = LeRobotDataset(REPO_ID, root=str(DATASET_HOME))
+        print(f"[DATASET] loaded from: {dataset_root}")
 
-        self._episode_idx += 1
-        self._frames.clear()
+    return dataset
+
 
 
 def get_obs_state(model: mujoco.MjModel, data: mujoco.MjData, site_id: int) -> np.ndarray:
@@ -165,7 +190,7 @@ def main():
     # dataset setup
     TASK_NAME = "piper_single_arm_quest3_real"
     NUM_DEMO = 50
-    dataset = EpisodeDataset(out_dir=_HERE / "dataset_out")
+    dataset = make_or_load_dataset(model=model)
 
     # Quest3
     teleop = Quest3Teleop()
@@ -270,10 +295,6 @@ def main():
         print("[RESET] complete.")
 
     try:
-        print("[INFO] Connected. (Right Controller)")
-        print("  - Hold squeeze: move target")
-        print("  - Button B (button1): reset episode (hold + target reset)")
-        print("  - Button A (button0): save episode (if recording)")
         if key_id != -1:
             print("  - BEFORE START: moving hardware to keyframe 'home' (press B to abort)")
             # move to home + sync Mujoco + anchor from measured pose

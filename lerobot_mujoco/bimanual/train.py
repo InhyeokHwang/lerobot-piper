@@ -17,7 +17,7 @@ from lerobot.configs.types import FeatureType
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--root", type=str, required=True, help="Dataset root folder (contains meta/, data/)")
-    p.add_argument("--repo_id", type=str, default="dual_arm_teleop_npz", help="Dataset repo_id used in create()")
+    p.add_argument("--repo_id", type=str, default="dual_arm_teleop", help="Dataset repo_id used in create()")
     p.add_argument("--out", type=str, default="./ckpt/act_dual_arm", help="Output checkpoint dir")
     p.add_argument("--chunk_size", type=int, default=10)
     p.add_argument("--n_action_steps", type=int, default=10)
@@ -44,7 +44,7 @@ def main():
     # output = ACTION only
     output_features = {k: ft for k, ft in policy_features.items() if ft.type is FeatureType.ACTION}
 
-    # input = everything else (state-only dataset면 observation.environment_state만 남음)
+    # input = everything else
     input_features = {k: ft for k, ft in policy_features.items() if k not in output_features}
 
     if len(output_features) == 0:

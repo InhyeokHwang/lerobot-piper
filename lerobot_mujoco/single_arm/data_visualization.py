@@ -2,71 +2,72 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, List
 
 import mujoco
 import mujoco.viewer
-
 import mink
-
 import numpy as np
 from loop_rate_limiters import RateLimiter
 
-from mink_ik.single_arm_mink_ik import(
-    pick_ee_site,
-    initialize_model,
-)
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from mink_ik.single_arm_mink_ik import pick_ee_site, initialize_model
+
 
 def _vec1(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
 
-def load_episode_npz(ep_path: Path) -> List[Dict[str, Any]]:
-    """episode_XXXX.npz -> frames(list[dict])"""
-    data = np.load(ep_path, allow_pickle=True)
-    frames_obj = data["frames"]  # dtype=object array
-    frames = list(frames_obj.tolist())
-    if not isinstance(frames, list) or (len(frames) > 0 and not isinstance(frames[0], dict)):
-        raise ValueError(f"Invalid frames format in {ep_path}")
-    return frames
+def set_mocap_target_from_target_state(
+    model: mujoco.MjModel, data: mujoco.MjData, target_state: np.ndarray
+) -> None:
+    ts = _vec1(target_state)
 
-def set_mocap_target_from_target_state(model: mujoco.MjModel, data: mujoco.MjData, target_state: np.ndarray):
-    target_state = _vec1(target_state) # target_state (single arm): [pos(3), quat_wxyz(4)] => (7,)
-    if target_state.size < 7:
-        raise ValueError(f"target_state expected size 7, got {target_state.size}")
-
-    pos = target_state[0:3]
-    quat = target_state[3:7]
+    pos = ts[0:3]
+    quat = ts[3:7]  # wxyz expected
 
     mocap_id = model.body("target").mocapid
+    data.mocap_pos[mocap_id] = pos
+    data.mocap_quat[mocap_id] = quat
 
-    data.mocap_pos[mocap_id] = pos.reshape(3,)
-    data.mocap_quat[mocap_id] = quat.reshape(4,)
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="dataset_out", help="dir containing episode_XXXX.npz")
-    parser.add_argument("--episode", type=int, default=0, help="episode index (0 -> episode_0000.npz)")
-    parser.add_argument("--hz", type=float, default=20.0, help="replay rate (Hz)")
-    parser.add_argument("--loop", action="store_true", help="loop episode forever")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--root", type=str, default=str((Path(__file__).resolve().parent / "demo_data").resolve()))
+    p.add_argument("--repo_id", type=str, default="dual_arm_teleop")
+    p.add_argument("--episode", type=int, default=0)
+    p.add_argument("--hz", type=float, default=20.0)
+    p.add_argument("--loop", action="store_true")
+    args = p.parse_args()
 
-    here = Path(__file__).resolve().parent
-    # dataset path
-    data_dir = (here / args.data_dir).resolve()
-    ep_path = data_dir / f"episode_{args.episode:04d}.npz"
-    if not ep_path.exists():
-        raise FileNotFoundError(f"Episode file not found: {ep_path}")
+    root = Path(args.root).resolve()
 
-    frames = load_episode_npz(ep_path)
-    if len(frames) == 0:
-        raise RuntimeError(f"Empty episode: {ep_path}")
+    dataset_dir = root  
+    if not (dataset_dir / "meta").exists() or not (dataset_dir / "data").exists():
+        raise FileNotFoundError(
+            f"Dataset not found at {dataset_dir}. Expected {dataset_dir}/meta and {dataset_dir}/data."
+        )
+    
+    ds = LeRobotDataset(args.repo_id, root=str(root), download_videos=False)
 
-    print(f"[VIS] Loaded {len(frames)} frames from {ep_path}")
+    if not hasattr(ds, "hf_dataset"):
+        raise RuntimeError("This LeRobotDataset version has no hf_dataset attribute; tell me what attributes it has.")
 
-    # MuJoCo model/data
+    hf = ds.hf_dataset  # datasets.Dataset
+    ep_idx = np.asarray(hf["episode_index"])
+    indices = np.nonzero(ep_idx == args.episode)[0]
+    if indices.size == 0:
+        raise ValueError(f"No frames found for episode_index={args.episode}. Available episodes: {np.unique(ep_idx)[:20]}...")
+
+    # timestamp 
+    ts = np.asarray(hf["timestamp"])[indices]
+    order = np.argsort(ts)
+    indices = indices[order]
+
+    print(f"[VIS] Loaded episode {args.episode}: frames={len(indices)} from dataset={dataset_dir}")
+
+    # MuJoCo init
     model, data, configuration = initialize_model()
 
-    # keyframe (initial pose)
+    # initial pose
     key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
     if key_id != -1:
         mujoco.mj_resetDataKeyframe(model, data, key_id)
@@ -74,49 +75,51 @@ def main():
         mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
 
-    # EE sites, mocap target init
+    # mocap target init
     ee_site = pick_ee_site(model)
     mink.move_mocap_to_frame(model, data, "target", ee_site, "site")
     mujoco.mj_forward(model, data)
 
     rate = RateLimiter(frequency=float(args.hz), warn=False)
 
-    with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=False) as viewer:
+    with mujoco.viewer.launch_passive(
+        model=model,
+        data=data,
+        show_left_ui=False,
+        show_right_ui=False,
+    ) as viewer:
         mujoco.mjv_defaultFreeCamera(model, viewer.cam)
 
-        idx = 0
+        i = 0
         while viewer.is_running():
-            fr = frames[idx]
-            # robot replay
-            if "action.qpos" in fr:
-                qpos = _vec1(fr["action.qpos"])
+            row = hf[int(indices[i])]  # dict-like
+
+            if "action" in row and row["action"] is not None:
+                qpos = _vec1(row["action"])
                 if qpos.size != model.nq:
-                    raise ValueError(
-                        f"action.qpos size mismatch at idx={idx}: got {qpos.size}, expected model.nq={model.nq}"
-                    )
+                    raise ValueError(f"action size mismatch: got {qpos.size}, expected {model.nq}")
                 data.qpos[:] = qpos
                 if data.qvel.size > 0:
                     data.qvel[:] = 0.0
 
-            # target(mocap) replay
-            if "observation.target" in fr:
+            if "observation.target" in row and row["observation.target"] is not None:
                 try:
-                    set_mocap_target_from_target_state(model, data, fr["observation.target"])
+                    set_mocap_target_from_target_state(model, data, row["observation.target"])
                 except Exception as e:
-                    print(f"[VIS][WARN] target update failed at idx={idx}: {type(e).__name__}: {e}")
+                    print(f"[VIS][WARN] target update failed at i={i}: {type(e).__name__}: {e}")
 
             mujoco.mj_forward(model, data)
-
             viewer.sync()
             rate.sleep()
 
-            idx += 1
-            if idx >= len(frames):
+            i += 1
+            if i >= len(indices):
                 if args.loop:
-                    idx = 0
+                    i = 0
                 else:
                     print("[VIS] Done.")
                     break
+
 
 if __name__ == "__main__":
     main()

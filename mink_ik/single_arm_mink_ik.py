@@ -33,6 +33,21 @@ RATE_HZ = 100.0
 TARGET_RADIUS = 0.03
 TARGET_RGBA = [1.0, 0.1, 0.1, 0.9]
 
+# roll <-> yaw
+R_SWAP_XZ = np.array([
+    [0.0, 0.0, 1.0],
+    [0.0,-1.0, 0.0],
+    [1.0, 0.0, 0.0],
+], dtype=np.float64) 
+
+# 부호 교정
+R_FLIP_RP = np.array([
+    [-1.0,  0.0,  0.0],
+    [ 0.0, 1.0,  0.0],
+    [ 0.0,  0.0,  1.0],
+], dtype=np.float64)  # = Rz(pi), det=+1
+
+
 def pick_ee_site(model: mujoco.MjModel) -> str:
     if mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "gripper") != -1:
         return "gripper"
@@ -141,6 +156,23 @@ def apply_configuration(
             continue
         data.ctrl[a_id] = float(configuration.q[qadr])
 
+def gripper_step(
+    *, model: mujoco.MjModel, data: mujoco.MjData, cmd: float, state: Dict,
+    init: bool = False, act_name: str = "gripper"
+) -> None:
+    gripper_value = float(np.clip(cmd, 0.0, 1.0))
+    gripper_value = 1.0 - gripper_value # invert
+
+    if init or ("act_id" not in state):
+        state["act_id"] = model.actuator(act_name).id
+        low, high = model.actuator_ctrlrange[state["act_id"]]
+        state["low"] = float(low)
+        state["high"] = float(high)
+
+    act_id = int(state["act_id"])
+    low = float(state["low"])
+    high = float(state["high"])
+    data.ctrl[act_id] = low + (high - low) * gripper_value
 
 
 def main():
@@ -174,6 +206,10 @@ def main():
 
     # ctrl map
     joint2act = build_ctrl_map_for_joints(model)
+
+    # gripper setup
+    grip_state: Dict = {} #cache
+    gripper_step(model=model, data=data, cmd=0.0, state=grip_state, init=True) # 캐시 초기화는 처음만
 
     # init mocap target to current EE
     mink.move_mocap_to_frame(model, data, "target", ee_site, "site")
@@ -210,6 +246,9 @@ def main():
             frame_dt = rate.dt
             frame = teleop.read()
 
+            # gripper
+            grip_cmd = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
+
             # reset: right button B
             reset_now = bool(frame.right_state.button1)
             reset = reset_now and (not prev_reset)
@@ -222,6 +261,7 @@ def main():
 
             # controller pose -> 4x4
             T_ctrl = T_from_pos_quat_xyzw(frame.right_pose.pos, frame.right_pose.quat)
+            T_ctrl[:3,:3] = T_ctrl[:3,:3] @ (R_FLIP_RP @ R_SWAP_XZ)
 
             # mocap pose -> 4x4
             mocap_id = model.body("target").mocapid
@@ -248,6 +288,10 @@ def main():
                 configuration.integrate_inplace(vel, ik_dt)
 
                 apply_configuration(model, data, configuration, joint2act=joint2act)
+
+                # gripper ctrl 
+                gripper_step(model=model, data=data, cmd=grip_cmd, state=grip_state, init=False)
+
                 mujoco.mj_step(model, data)
 
                 reached = check_reached_single(
