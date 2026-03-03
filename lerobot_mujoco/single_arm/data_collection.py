@@ -376,6 +376,11 @@ def main():
 
     finally:
         stop_event.set()
+
+        try:
+            th.join(timeout=1.0)
+        except Exception:
+            pass
         dataset.finalize()
         print("[DATASET] finalize() done")
 
