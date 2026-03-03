@@ -111,7 +111,6 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
                 "names": ["qpos"],
             }
         }
-
         dataset = LeRobotDataset.create(
             repo_id=REPO_ID,
             root=str(DATASET_HOME),     
@@ -197,6 +196,7 @@ def main():
     tasks = [ee_task, posture_task]
     posture_task.set_target_from_configuration(configuration)
 
+    # map joints to <actuator> for dynamics in simulator
     joint2act = build_ctrl_map_for_joints(model)
 
     # gripper init
@@ -212,18 +212,25 @@ def main():
 
     follow = Controller(use_rotation=True, pos_scale=1.0, R_fix=np.eye(3))
 
+    # episode logic
     episode_id = 0
     record_flag = False
+    prev_reset = False
+    prev_done = False
 
     def hard_reset():
         nonlocal record_flag, follow, grip_state
 
+        follow = Controller(use_rotation=True, pos_scale=1.0, R_fix=np.eye(3))
+
+        ## move to key frame
         if key_id != -1:
             mujoco.mj_resetDataKeyframe(model, data, key_id)
         else:
             mujoco.mj_resetData(model, data)
         mujoco.mj_forward(model, data)
         configuration.update(data.qpos)
+        ## 
 
         posture_task.set_target_from_configuration(configuration)
         gripper_step(model=model, data=data, cmd=0.0, state=grip_state, init=False)
@@ -233,20 +240,18 @@ def main():
 
         dataset.clear_episode_buffer()
         record_flag = False
-        follow = Controller(use_rotation=True, pos_scale=1.0, R_fix=np.eye(3))
         print("[RESET] env + episode buffer cleared")
-
-    prev_reset = False
-    prev_done = False
 
     try:
         with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=True) as viewer:
+            ## camera ##
             mujoco.mjv_defaultFreeCamera(model, viewer.cam)
             renderer = mujoco.Renderer(model, height=IMG_H, width=IMG_W)
-
             last_front_rgb = None
             last_wrist_rgb = None
+            ##
 
+            ## teleop ##
             latest = {"frame": None}
             stop_event = threading.Event()
             def teleop_thread():
@@ -255,10 +260,12 @@ def main():
                     time.sleep(0.01)  
             th = threading.Thread(target=teleop_thread, daemon=True)
             th.start()
+            ##
 
             while viewer.is_running() and episode_id < NUM_DEMO:
                 frame = latest["frame"] # teleop frame
                 if frame is None:
+                    viewer.sync()
                     rate.sleep()
                     continue
                 
@@ -315,9 +322,10 @@ def main():
                     vel = mink.solve_ik(configuration, tasks, ik_dt, SOLVER, DAMPING)
                     configuration.integrate_inplace(vel, ik_dt)
 
+                    # physics
                     apply_configuration(model, data, configuration, joint2act=joint2act)
                     gripper_step(model=model, data=data, cmd=grip_cmd, state=grip_state, init=False)
-                    mujoco.mj_step(model, data)
+                    mujoco.mj_step(model, data) # step is for physics, forward is for fk+constraint
 
                     reached = check_reached_single(
                         model, data, site_id,
@@ -363,7 +371,6 @@ def main():
                         dataset.add_frame(frame_dict)
                     draw_rgb_panels_on_viewer(viewer, last_front_rgb, last_wrist_rgb) # camera
                 # ---------------------------------------
-
                 viewer.sync()
                 rate.sleep()
 
