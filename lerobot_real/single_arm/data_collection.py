@@ -4,9 +4,11 @@ from pathlib import Path
 from typing import Dict
 import threading
 import time
-
+from typing import Dict
 import numpy as np
 import mujoco
+import mujoco.viewer
+
 import mink
 from loop_rate_limiters import RateLimiter
 
@@ -29,9 +31,6 @@ from mink_ik.quest3_utils import (
 
 from lerobot_real.hardware_config.piper.piper_config import PiperRobotConfig
 from lerobot_real.hardware_config.piper.piper_follower import PiperFollower
-
-from camera_utils.real_camera_utils import OpenCVCameraStreamer, CameraStreamerConfig
-
 
 _HERE = Path(__file__).parent
 SOLVER = "daqp"
@@ -84,11 +83,10 @@ FPS = int(REC_HZ)
 
 IMG_H, IMG_W = 256, 256  # dataset image shape
 DUMMY_FRONT = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
-
+DUMMY_WRIST = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
 
 def _vec1(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
-
 
 def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
     dataset_root = DATASET_HOME / REPO_ID
@@ -141,29 +139,16 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
         print(f"[DATASET] loaded from: {dataset_root}")
     return dataset
 
-
 def get_obs_state(model: mujoco.MjModel, data: mujoco.MjData, site_id: int) -> np.ndarray:
     pos, quat = site_pose(model, data, site_id)  # quat is wxyz
     return np.concatenate([pos, quat], axis=0).astype(np.float32)
-
 
 def clamp_step_deg(q_meas_deg: np.ndarray, q_cmd_deg: np.ndarray, max_dq_deg: float) -> np.ndarray:
     dq = np.clip(q_cmd_deg - q_meas_deg, -max_dq_deg, max_dq_deg)
     return q_meas_deg + dq
 
-
 def extract_qpos_deg_from_obs(obs: Dict) -> np.ndarray:
     return np.array([obs[f"joint_{i}.pos"] for i in range(1, 7)], dtype=np.float64)
-
-
-def build_action_joints_only(q_deg: np.ndarray) -> Dict:
-    return {f"joint_{i}.pos": float(q_deg[i - 1]) for i in range(1, 7)}
-
-
-def build_action_joints_and_gripper(q_deg: np.ndarray, gripper_norm: float) -> Dict:
-    a = build_action_joints_only(q_deg)
-    a["gripper.pos"] = float(np.clip(gripper_norm, 0.0, 1.0))
-    return a
 
 
 def get_home_qpos_deg(model: mujoco.MjModel, key_id: int) -> np.ndarray:
@@ -174,7 +159,6 @@ def get_home_qpos_deg(model: mujoco.MjModel, key_id: int) -> np.ndarray:
         q_home = kq[key_id * model.nq : (key_id + 1) * model.nq]
     q_home = np.asarray(q_home, dtype=np.float64).reshape(-1)
     return np.rad2deg(q_home[:6]).reshape(6,)
-
 
 def move_to_keyframe_home(
     *,
@@ -187,7 +171,7 @@ def move_to_keyframe_home(
 ) -> bool:
     q_goal_deg = get_home_qpos_deg(model, key_id)
     print(f"[HOME] goal_deg = {np.round(q_goal_deg, 2)}")
-    robot.send_action(build_action_joints_only(q_goal_deg))
+    robot.send_action(q_goal_deg)
 
     t_start = time.perf_counter()
     while True:
@@ -201,7 +185,7 @@ def move_to_keyframe_home(
 
         if (time.perf_counter() - t_start) > timeout_sec:
             print(f"[HOME] timeout after {timeout_sec:.1f}s (max_err={float(err.max()):.2f} deg). Holding.")
-            robot.send_action(build_action_joints_only(q_meas_deg))
+            robot.send_action(q_meas_deg)
             return False
 
         rate.sleep()
@@ -248,41 +232,6 @@ def main():
     robot = PiperFollower(piper_cfg)
     robot.connect(calibrate=False)
 
-    # ---------------- camera (OpenCVCameraStreamer) ----------------
-    # shared stereo buffer: (H, 2W, 3)  -> 왼쪽 절반만 써도 되지만 streamer가 stereo로 쓰게 해둠
-    cam_stereo = np.zeros((IMG_H, IMG_W * 2, 3), dtype=np.uint8)
-
-    cam_cfg = CameraStreamerConfig(
-        camera="/dev/video4",  
-        rgb=True,
-        duplicate_stereo=True,
-        width=640,
-        height=480,
-        fps=30.0,
-        fourcc="YUYV",
-        warn_every_n=60,
-    )
-    cam = OpenCVCameraStreamer(cam_stereo, cam_cfg)
-
-    cam_stop = threading.Event()
-
-    def cam_thread():
-        # step() 안에서 open()도 해주므로 여기선 loop만
-        while not cam_stop.is_set():
-            cam.step()
-            # 너무 빡세게 돌 필요 없음 (캡처가 블로킹 + 내부에서 resize/cvt)
-            time.sleep(0.001)
-
-    cth = threading.Thread(target=cam_thread, daemon=True)
-    cth.start()
-
-    def get_wrist_rgb_local() -> np.ndarray | None:
-        # cam_stereo = [left|right] 동일 복제
-        # left half만 잘라서 (H, W, 3)로 사용
-        img = cam_stereo[:, :IMG_W, :]
-        # 완전 안전하게 복사(데이터셋에 들어갈 때 cam thread가 덮어쓸 수 있으니)
-        return np.ascontiguousarray(img)
-
     # ---------------- timing ----------------
     rate = RateLimiter(frequency=RATE_HZ, warn=False)
     rec_accum = 0.0
@@ -306,6 +255,7 @@ def main():
     th = threading.Thread(target=teleop_thread, daemon=True)
     th.start()
 
+    # hw -> mujoco sync
     def sync_mujoco_from_measured():
         obs = robot.get_observation()
         q_meas_deg = extract_qpos_deg_from_obs(obs)
@@ -313,11 +263,6 @@ def main():
         mujoco.mj_forward(model, data)
         configuration.update(data.qpos)
         return q_meas_deg
-
-    def reset_mocap_to_ee_and_anchor_posture():
-        mink.move_mocap_to_frame(model, data, "target", ee_site, "site")
-        mujoco.mj_forward(model, data)
-        posture_task.set_target_from_configuration(configuration)
 
     def hard_reset():
         nonlocal record_flag, follow, rec_accum, episode_frames
@@ -347,151 +292,138 @@ def main():
             print(f"[WARN] gripper open failed: {e}")
 
         sync_mujoco_from_measured()
-        reset_mocap_to_ee_and_anchor_posture()
+        mink.move_mocap_to_frame(model, data, "target", ee_site, "site")
+        mujoco.mj_forward(model, data)
+        posture_task.set_target_from_configuration(configuration)
 
         print("[RESET] env + episode buffer cleared")
 
     try:
-        hard_reset()
+        with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=True) as viewer:
 
-        while episode_id < NUM_DEMO:
-            frame = latest["frame"]
-            if frame is None:
+            hard_reset()
+
+            while viewer.is_running() and episode_id < NUM_DEMO:
+                frame = latest["frame"]
+                if frame is None:
+                    viewer.sync()
+                    rate.sleep()
+                    continue
+
+                grip_norm = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
+
+                frame_dt = rate.dt
+                ik_dt = frame_dt / float(max(1, MAX_ITERS_PER_CYCLE))
+
+                reset_now = bool(frame.right_state.button1)  # B
+                reset = reset_now and (not prev_reset)
+                prev_reset = reset_now
+                if reset:
+                    print("[ABORT] button B pressed. discard episode + reset")
+                    hard_reset()
+                    rate.sleep()
+                    continue
+
+                done_now = bool(frame.right_state.button0)  # A
+                done = done_now and (not prev_done)
+                prev_done = done_now
+                if done:
+                    print(f"[DONE] button A pressed. record_flag={record_flag} frames={episode_frames}")
+                    if record_flag:
+                        dataset.save_episode()
+                        episode_id += 1
+                        print(f"[DATASET] Episode saved. episode_id={episode_id}/{NUM_DEMO}")
+                    hard_reset()
+                    continue
+
+                q_meas_deg = sync_mujoco_from_measured()
+
+                T_ctrl = T_from_pos_quat_xyzw(frame.right_pose.pos, frame.right_pose.quat)
+                T_ctrl[:3, :3] = T_ctrl[:3, :3] @ (R_FLIP_RP @ R_SWAP_XZ)
+
+                T_moc_now = T_from_mocap(model, data, mocap_id)
+                ok, T_des = follow.update(frame.right_state.squeeze, T_ctrl, T_moc_now)
+                if ok and T_des is not None:
+                    set_mocap_from_T(data, mocap_id, T_des)
+
+                if (not record_flag) and ok:
+                    record_flag = True
+                    print("[DATASET] Start recording")
+
+                ee_task.set_target(mink.SE3.from_mocap_name(model, data, "target"))
+
+                target_pos = data.mocap_pos[mocap_id].copy()
+                target_quat = data.mocap_quat[mocap_id].copy()
+
+                for _ in range(MAX_ITERS_PER_CYCLE):
+                    vel = mink.solve_ik(configuration, tasks, ik_dt, SOLVER, DAMPING)
+                    configuration.integrate_inplace(vel, ik_dt)
+
+                    data.qpos[:] = configuration.q
+                    mujoco.mj_forward(model, data)
+
+                    reached = check_reached_single(
+                        model,
+                        data,
+                        site_id,
+                        target_pos,
+                        target_quat,
+                        POS_THRESHOLD,
+                        ORI_THRESHOLD,
+                    )
+                    if reached:
+                        break
+
+                q_cmd_deg = np.rad2deg(np.array(configuration.q, dtype=np.float64)[:6].copy())
+                q_cmd_deg = clamp_step_deg(q_meas_deg, q_cmd_deg, MAX_DQ_PER_STEP_DEG)
+
+                robot.send_action(q_cmd_deg, grip_norm)
+
+                # -------- data collection --------
+                rec_accum += frame_dt
+                if rec_accum >= REC_DT:
+                    rec_accum -= REC_DT
+
+                    obs_state = get_obs_state(model, data, site_id)
+                    tpos = _vec1(data.mocap_pos[mocap_id])[:3]
+                    tquat = _vec1(data.mocap_quat[mocap_id])[:4]
+                    target_state = np.concatenate([tpos, tquat], axis=0).astype(np.float32)
+
+                    action_qpos = np.deg2rad(q_cmd_deg).astype(np.float32)
+
+                    if record_flag:
+                        frame_dict = {
+                            "observation.state": obs_state,
+                            "observation.target": target_state,
+                            "action": action_qpos,
+                            "action.gripper": np.array([grip_norm], dtype=np.float32),
+                            "task": TASK_NAME,
+                        }
+                        frame_dict["observation.front_image"] = DUMMY_FRONT
+                        frame_dict["observation.wrist_image"] = DUMMY_WRIST
+                        
+                        dataset.add_frame(frame_dict)
+                        episode_frames += 1
+                # ---------------------------------------
+                viewer.sync()
                 rate.sleep()
-                continue
-
-            grip_norm = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
-
-            frame_dt = rate.dt
-            ik_dt = frame_dt / float(max(1, MAX_ITERS_PER_CYCLE))
-
-            reset_now = bool(frame.right_state.button1)  # B
-            reset = reset_now and (not prev_reset)
-            prev_reset = reset_now
-            if reset:
-                print("[ABORT] button B pressed. discard episode + reset")
-                hard_reset()
-                rate.sleep()
-                continue
-
-            done_now = bool(frame.right_state.button0)  # A
-            done = done_now and (not prev_done)
-            prev_done = done_now
-            if done:
-                print(f"[DONE] button A pressed. record_flag={record_flag} frames={episode_frames}")
-                if record_flag:
-                    dataset.save_episode()
-                    episode_id += 1
-                    print(f"[DATASET] Episode saved. episode_id={episode_id}/{NUM_DEMO}")
-                hard_reset()
-                continue
-
-            q_meas_deg = sync_mujoco_from_measured()
-
-            T_ctrl = T_from_pos_quat_xyzw(frame.right_pose.pos, frame.right_pose.quat)
-            T_ctrl[:3, :3] = T_ctrl[:3, :3] @ (R_FLIP_RP @ R_SWAP_XZ)
-
-            T_moc_now = T_from_mocap(model, data, mocap_id)
-            ok, T_des = follow.update(frame.right_state.squeeze, T_ctrl, T_moc_now)
-            if ok and T_des is not None:
-                set_mocap_from_T(data, mocap_id, T_des)
-
-            if (not record_flag) and ok:
-                record_flag = True
-                print("[DATASET] Start recording")
-
-            ee_task.set_target(mink.SE3.from_mocap_name(model, data, "target"))
-
-            target_pos = data.mocap_pos[mocap_id].copy()
-            target_quat = data.mocap_quat[mocap_id].copy()
-
-            for _ in range(MAX_ITERS_PER_CYCLE):
-                vel = mink.solve_ik(configuration, tasks, ik_dt, SOLVER, DAMPING)
-                configuration.integrate_inplace(vel, ik_dt)
-
-                data.qpos[:] = configuration.q
-                mujoco.mj_forward(model, data)
-
-                reached = check_reached_single(
-                    model,
-                    data,
-                    site_id,
-                    target_pos,
-                    target_quat,
-                    POS_THRESHOLD,
-                    ORI_THRESHOLD,
-                )
-                if reached:
-                    break
-
-            q_cmd_deg = np.rad2deg(np.array(configuration.q, dtype=np.float64)[:6].copy())
-            q_cmd_deg = clamp_step_deg(q_meas_deg, q_cmd_deg, MAX_DQ_PER_STEP_DEG)
-
-            robot.send_action(build_action_joints_and_gripper(q_cmd_deg, grip_norm))
-
-            # -------- data collection --------
-            rec_accum += frame_dt
-            if rec_accum >= REC_DT:
-                rec_accum -= REC_DT
-
-                obs_state = get_obs_state(model, data, site_id)
-                tpos = _vec1(data.mocap_pos[mocap_id])[:3]
-                tquat = _vec1(data.mocap_quat[mocap_id])[:4]
-                target_state = np.concatenate([tpos, tquat], axis=0).astype(np.float32)
-
-                action_qpos = data.qpos.copy().astype(np.float32)
-
-                if record_flag:
-                    front = np.ascontiguousarray(DUMMY_FRONT)
-
-                    wrist = get_wrist_rgb_local()
-                    if wrist is None:
-                        wrist = DUMMY_FRONT
-                    wrist = np.ascontiguousarray(wrist)
-
-                    frame_dict = {
-                        "observation.state": obs_state,
-                        "observation.target": target_state,
-                        "action": action_qpos,
-                        "action.gripper": np.array([grip_norm], dtype=np.float32),
-                        "task": TASK_NAME,
-                        "observation.front_image": front,
-                        "observation.wrist_image": wrist,
-                    }
-
-                    dataset.add_frame(frame_dict)
-                    episode_frames += 1
-            # ---------------------------------------
-
-            rate.sleep()
 
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt")
     finally:
         # stop threads first
         stop_event.set()
-        cam_stop.set()
 
         try:
             th.join(timeout=1.0)
         except Exception:
             pass
-        try:
-            cth.join(timeout=1.0)
-        except Exception:
-            pass
-
-        # close camera
-        try:
-            cam.close()
-        except Exception as e:
-            print(f"[WARN] cam.close failed: {e}")
 
         # safe hold
         try:
             obs = robot.get_observation()
             q_hold_deg = extract_qpos_deg_from_obs(obs)
-            robot.send_action(build_action_joints_and_gripper(q_hold_deg, 1.0))
+            robot.send_action(q_hold_deg)
             print("[SAFE] sent hold action (measured posture).")
         except Exception as e:
             print(f"[WARN] failed to send hold action: {e}")

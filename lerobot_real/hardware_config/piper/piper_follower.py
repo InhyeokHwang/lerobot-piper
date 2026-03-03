@@ -4,7 +4,8 @@ from __future__ import annotations
 import logging
 import time
 from functools import cached_property
-from typing import Any
+from typing import Optional, Union, Mapping, Any
+import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
 from lerobot.motors import Motor, MotorNormMode
@@ -134,10 +135,38 @@ class PiperFollower(Robot):
 
         # open=1, close=0
         return close_mm + g * (open_mm - close_mm)
-    
+
+
     @check_if_not_connected
-    def send_action(self, action: RobotAction) -> RobotAction:
-        goal_pos = {k.removesuffix(".pos"): float(v) for k, v in action.items() if k.endswith(".pos")}
+    def send_action(
+        self,
+        action: Union[Mapping[str, Any], np.ndarray],
+        gripper_norm: Optional[float] = None,
+    ) -> RobotAction:
+        """
+        Accepts either:
+        1) action dict: {"joint_1.pos": ..., "gripper.pos": ...}
+        2) q_deg ndarray: (6,) degrees, with optional gripper_norm
+
+        This lets main code always call robot.send_action(...)
+        """
+        if isinstance(action, np.ndarray):
+            q_deg = np.asarray(action, dtype=np.float64).reshape(-1)
+            if q_deg.shape[0] < 6:
+                raise ValueError(f"q_deg must have at least 6 elements, got {q_deg.shape}")
+
+            act: RobotAction = {f"joint_{i}.pos": float(q_deg[i - 1]) for i in range(1, 7)}
+            if gripper_norm is not None:
+                act["gripper.pos"] = float(np.clip(gripper_norm, 0.0, 1.0))
+            action = act  
+
+        action = dict(action) 
+
+        goal_pos = {
+            k.removesuffix(".pos"): float(v)
+            for k, v in action.items()
+            if isinstance(k, str) and k.endswith(".pos")
+        }
 
         joint_limits = getattr(self.config, "joint_limits", None)
         if joint_limits:
@@ -146,22 +175,26 @@ class PiperFollower(Robot):
                     lo, hi = joint_limits[m]
                     goal_pos[m] = max(float(lo), min(float(hi), float(val)))
 
-        gripper_norm = goal_pos.pop("gripper", None)
+        gripper_norm2 = goal_pos.pop("gripper", None)
 
         # joints 전송
         if goal_pos:
             self.bus.sync_write("Goal_Position", goal_pos)
 
         # gripper 전송 (0~1 -> mm)
-        if gripper_norm is not None:
-            target_mm = self._gripper_norm_to_mm(gripper_norm)
-            self.bus._sdk.send_gripper_mm(target_mm, effort_n=self.config.gripper_effort_n, enable=True)
-
-        # 반환은 “학습/로깅용”으로 원래 스케일(0~1)을 유지
+        if gripper_norm2 is not None:
+            gripper_norm2 = float(np.clip(gripper_norm2, 0.0, 1.0))
+            target_mm = self._gripper_norm_to_mm(gripper_norm2)
+            self.bus._sdk.send_gripper_mm(
+                target_mm,
+                effort_n=self.config.gripper_effort_n,
+                enable=True,
+            )
         out = {f"{m}.pos": v for m, v in goal_pos.items()}
-        if gripper_norm is not None:
-            out["gripper.pos"] = float(max(0.0, min(1.0, gripper_norm)))
+        if gripper_norm2 is not None:
+            out["gripper.pos"] = float(gripper_norm2)
         return out
+    
 
     @check_if_not_connected
     def disconnect(self) -> None:
