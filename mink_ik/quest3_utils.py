@@ -1,6 +1,7 @@
 import mujoco
 import numpy as np
 
+### these are for bimanual
 CTRL2EE_RIGHT = np.eye(4, dtype=np.float64)
 
 CTRL2EE_LEFT = np.eye(4, dtype=np.float64)
@@ -9,16 +10,14 @@ CTRL2EE_LEFT[:3, :3] = np.array([
     [1.0, 0.0, 0.0],
     [0.0, 0.0,-1.0],
 ], dtype=np.float64) 
-
+#######################
 
 def _as_int(i) -> int:
     return int(np.asarray(i).reshape(-1)[0])
 
-
 def _as_vec(x, n: int) -> np.ndarray:
     # (n,), (1,n), (n,1) 등 뭐가 와도 (n,)로 정리
     return np.asarray(x, dtype=np.float64).reshape(-1)[:n]
-
 
 def T_from_pos_quat_xyzw(pos: np.ndarray, quat_xyzw: np.ndarray) -> np.ndarray:
     """pos(3,), quat_xyzw(4,) -> 4x4. MuJoCo quat is wxyz."""
