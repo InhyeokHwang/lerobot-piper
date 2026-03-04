@@ -114,13 +114,24 @@ class PiperFollower(Robot):
         states = self.bus.sync_read_all_states()
         obs: dict[str, Any] = {}
 
+        # arm joints (deg)
         for m in self.bus.motors.keys():
             st = states.get(m, {})
             obs[f"{m}.pos"] = float(st.get("position", 0.0))
-            # vel/torque는 bus가 지원할 때만 들어오도록 (bus가 0.0으로 채워도 OK)
             obs[f"{m}.vel"] = float(st.get("velocity", 0.0))
             obs[f"{m}.torque"] = float(st.get("torque", 0.0))
 
+        # gripper (mm + norm)
+        try:
+            mm = float(self.bus._sdk.read_gripper_position_mm())
+            obs["gripper.mm"] = mm
+
+            max_mm = float(getattr(self.config, "gripper_max_mm", 35.0))
+            obs["gripper.pos"] = float(np.clip(mm / max_mm, 0.0, 1.0))
+        except Exception:
+            pass
+
+        # cameras
         for cam_key, cam in self.cameras.items():
             obs[cam_key] = cam.async_read()
 

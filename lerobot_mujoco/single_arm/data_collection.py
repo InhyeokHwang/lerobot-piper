@@ -75,7 +75,6 @@ IMG_H, IMG_W = 256, 256
 AGENT_CAM = "agentview"
 WRIST_CAM = "wrist_cam"
 
-
 def _vec1(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
 
@@ -107,7 +106,7 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
             },
             "action": {
                 "dtype": "float32",
-                "shape": (model.nq,),  # qpos
+                "shape": (model.nq,),  # 1~6 for arm 7, 8 for gripper
                 "names": ["qpos"],
             }
         }
@@ -129,7 +128,6 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
 def get_obs_state(model: mujoco.MjModel, data: mujoco.MjData, site_id: int) -> np.ndarray:
     pos, quat = site_pose(model, data, site_id)
     return np.concatenate([pos, quat], axis=0)  # (7,)
-
 
 def gripper_step(
     *, model: mujoco.MjModel, data: mujoco.MjData, cmd: float, state: Dict,
@@ -154,11 +152,16 @@ def main():
     TASK_NAME = REPO_ID
     NUM_DEMO = 50
 
+    # Quest3
     teleop = Quest3Teleop()
 
+    # MuJoCo model
     model, data, configuration = initialize_model()
+
+    # dataset
     dataset = make_or_load_dataset(model=model)
 
+    # camera
     def require_camera(name: str):
         cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, name)
         if cam_id == -1:
@@ -177,9 +180,9 @@ def main():
     mujoco.mj_forward(model, data)
     configuration.update(data.qpos)
 
+    # EE site
     ee_site = pick_ee_site(model)
     print(f"[INFO] EE site: {ee_site}")
-
     site_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, ee_site)
     if site_id < 0:
         raise RuntimeError(f"EE site not found in model: {ee_site}")
@@ -325,7 +328,7 @@ def main():
                     # physics
                     apply_configuration(model, data, configuration, joint2act=joint2act)
                     gripper_step(model=model, data=data, cmd=grip_cmd, state=grip_state, init=False)
-                    mujoco.mj_step(model, data) # step is for physics, forward is for fk+constraint
+                    mujoco.mj_step(model, data) # mj_step is for physics
 
                     reached = check_reached_single(
                         model, data, site_id,
@@ -381,6 +384,7 @@ def main():
             th.join(timeout=1.0)
         except Exception:
             pass
+
         dataset.finalize()
         print("[DATASET] finalize() done")
 

@@ -161,7 +161,7 @@ class PiperSdkAdapter:
             else:
                 self.interface.DisableArm(int(jid))
 
-    # ---- read ----
+    # ---- arm read ----
     def read_joint_positions_deg(self, joint_ids: list[int]) -> dict[int, float]:
         if not self.is_connected:
             raise DeviceNotConnectedError("Device not connected")
@@ -241,7 +241,7 @@ class PiperSdkAdapter:
             out[jid] = 0.0 if eff is None else (eff * 0.001)
         return out
 
-    # ---- write ----
+    # ---- arm write ----
     def send_joint_positions_deg(self, targets: dict[int, float]) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError("Device not connected")
@@ -265,6 +265,37 @@ class PiperSdkAdapter:
 
         self.interface.JointCtrl(j1, j2, j3, j4, j5, j6)  # :contentReference[oaicite:18]{index=18}
 
+    # ---- gripper read ----
+    def read_gripper_position_mm(self) -> float:
+        """
+        Returns current gripper stroke in mm.
+        SDK: grippers_angle is in 0.001 mm.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError("Device not connected")
+
+        msg = self.interface.GetArmGripperMsgs()
+        if msg is None:
+            raise RuntimeError("GetArmGripperMsgs() returned None")
+
+        gs = msg.gripper_state
+        # 0.001 mm -> mm
+        return float(gs.grippers_angle) * 0.001
+
+    def read_gripper_effort_nm(self) -> float:
+        """
+        Returns gripper effort in N·m (approx).
+        SDK: grippers_effort is in 0.001 N·m.
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError("Device not connected")
+
+        msg = self.interface.GetArmGripperMsgs()
+        if msg is None:
+            raise RuntimeError("GetArmGripperMsgs() returned None")
+
+        gs = msg.gripper_state
+        return float(gs.grippers_effort) * 0.001
 
     # ---- gripper ----
     def enable_gripper(self, clear_error: bool = False) -> None:

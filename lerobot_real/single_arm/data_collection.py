@@ -29,6 +29,9 @@ from mink_ik.quest3_utils import (
     T_from_mocap,
 )
 
+from quest3.quest3_thread import start_teleop_thread
+from lerobot_real.hardware_config.piper.piper_thread import start_piper_thread, publish_piper_cmd, clear_piper_cmd
+
 from lerobot_real.hardware_config.piper.piper_config import PiperRobotConfig
 from lerobot_real.hardware_config.piper.piper_follower import PiperFollower
 
@@ -50,12 +53,9 @@ RATE_HZ = 50.0
 REC_HZ = 20.0
 REC_DT = 1.0 / REC_HZ
 
-# Safety clamp
-MAX_DQ_PER_STEP_DEG = 3.5
-
 HOME_REACH_TOL_DEG = 1.5
 HOME_TIMEOUT_SEC = 12.0
-HOME_SETTLE_SEC = 0.3
+HOME_SETTLE_SEC = 2.0
 
 # roll <-> yaw
 R_SWAP_XZ = np.array(
@@ -77,11 +77,11 @@ R_FLIP_RP = np.array(
     dtype=np.float64,
 )
 
-REPO_ID = "piper_single_arm_teleop"
+REPO_ID = "piper_single_arm_teleop_real"
 DATASET_HOME = (_HERE / "demo_data").resolve()
 FPS = int(REC_HZ)
 
-IMG_H, IMG_W = 256, 256  # dataset image shape
+IMG_H, IMG_W = 256, 256 
 DUMMY_FRONT = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
 DUMMY_WRIST = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
 
@@ -115,14 +115,9 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
         },
         "action": {
             "dtype": "float32",
-            "shape": (model.nq,),
+            "shape": (model.nq,), # 1~6 for arm 7, 8 for gripper
             "names": ["qpos"],
-        },
-        "action.gripper": {
-            "dtype": "float32",
-            "shape": (1,),
-            "names": ["gripper_norm"],
-        },
+        }
     }
     if create_new:
         dataset = LeRobotDataset.create(
@@ -142,22 +137,21 @@ def get_obs_state(model: mujoco.MjModel, data: mujoco.MjData, site_id: int) -> n
     pos, quat = site_pose(model, data, site_id)  # quat is wxyz
     return np.concatenate([pos, quat], axis=0).astype(np.float32)
 
-def clamp_step_deg(q_meas_deg: np.ndarray, q_cmd_deg: np.ndarray, max_dq_deg: float) -> np.ndarray:
-    dq = np.clip(q_cmd_deg - q_meas_deg, -max_dq_deg, max_dq_deg)
-    return q_meas_deg + dq
-
+# extract arm joint 1~6 from obs
 def extract_qpos_deg_from_obs(obs: Dict) -> np.ndarray:
     return np.array([obs[f"joint_{i}.pos"] for i in range(1, 7)], dtype=np.float64)
 
-
-def get_home_qpos_deg(model: mujoco.MjModel, key_id: int) -> np.ndarray:
+# get keyframe
+def get_home_qpos(model: mujoco.MjModel, key_id: int) -> np.ndarray:
     kq = np.asarray(model.key_qpos)
     if kq.ndim == 2:
         q_home = kq[key_id]
     else:
         q_home = kq[key_id * model.nq : (key_id + 1) * model.nq]
     q_home = np.asarray(q_home, dtype=np.float64).reshape(-1)
-    return np.rad2deg(q_home[:6]).reshape(6,)
+    q_arm_deg = np.rad2deg(q_home[:6]) # arm joint (deg)
+    q_gripper = q_home[6:8] # gripper 0-0.035 (m)
+    return np.concatenate([q_arm_deg, q_gripper])
 
 def move_to_keyframe_home(
     *,
@@ -165,36 +159,94 @@ def move_to_keyframe_home(
     key_id: int,
     robot: PiperFollower,
     rate: RateLimiter,
-    tol_deg: float,
+    tol_arm_deg: float,
+    tol_gripper: float,   
     timeout_sec: float,
+    latest_cmd: dict,
+    cmd_lock: threading.Lock,
 ) -> bool:
-    q_goal_deg = get_home_qpos_deg(model, key_id)
-    print(f"[HOME] goal_deg = {np.round(q_goal_deg, 2)}")
-    robot.send_action(q_goal_deg)
+    q_goal = get_home_qpos(model, key_id)  # arm(deg) + gripper(m,m)
+    arm_goal_deg = np.asarray(q_goal[:6], dtype=np.float64)
+
+    # (0~0.035)
+    grip_goal_m = float(q_goal[6])
+    grip_goal_norm = float(np.clip(grip_goal_m / 0.035, 0.0, 1.0))
+
+    print(f"[HOME] arm_goal_deg = {np.round(arm_goal_deg, 2)} | grip_goal_norm = {grip_goal_norm:.3f}")
+
+    # send initial command 
+    publish_piper_cmd(
+        latest_cmd=latest_cmd,
+        cmd_lock=cmd_lock,
+        q_cmd_deg=arm_goal_deg,
+        grip_cmd_m=grip_goal_m,
+    )
+
+    print("Home settle waiting")
+    time.sleep(HOME_SETTLE_SEC)
+    print("Home settle finished")
 
     t_start = time.perf_counter()
     while True:
         obs = robot.get_observation()
-        q_meas_deg = extract_qpos_deg_from_obs(obs)
-        err = np.abs(q_goal_deg - q_meas_deg)
+        arm_meas_deg = extract_qpos_deg_from_obs(obs)
 
-        if np.all(err <= tol_deg):
-            print(f"[HOME] reached (max_err={float(err.max()):.2f} deg).")
+        arm_err = np.abs(arm_goal_deg - arm_meas_deg)
+        arm_ok = bool(np.all(arm_err <= tol_arm_deg))
+        
+        grip_meas_raw = obs.get("gripper.pos", None)
+        if grip_meas_raw is None:
+            grip_meas_norm = None
+            grip_ok = True
+            grip_err = float("nan")
+        else:
+            grip_meas_norm = float(np.clip(float(grip_meas_raw), 0.0, 1.0))
+            grip_err = abs(grip_goal_norm - grip_meas_norm)
+            grip_ok = bool(grip_err <= tol_gripper)
+
+        if arm_ok and grip_ok:
+            max_arm_err = float(arm_err.max())
+            print(f"[HOME] reached (max_arm_err={max_arm_err:.2f} deg, grip_err={grip_err}).")
             return True
 
         if (time.perf_counter() - t_start) > timeout_sec:
-            print(f"[HOME] timeout after {timeout_sec:.1f}s (max_err={float(err.max()):.2f} deg). Holding.")
-            robot.send_action(q_meas_deg)
-            return False
+            max_arm_err = float(arm_err.max())
+            print(f"[HOME] timeout after {timeout_sec:.1f}s (max_arm_err={max_arm_err:.2f} deg). Holding measured.")
 
+            grip_hold_m = 0.0 if grip_meas_norm is None else (grip_meas_norm * 0.035)
+            publish_piper_cmd(
+                latest_cmd=latest_cmd,
+                cmd_lock=cmd_lock,
+                q_cmd_deg=np.asarray(arm_meas_deg, dtype=np.float64),
+                grip_cmd_m=grip_hold_m,
+            )
+            return False
+        # retry
+        publish_piper_cmd(
+            latest_cmd=latest_cmd,
+            cmd_lock=cmd_lock,
+            q_cmd_deg=arm_goal_deg,
+            grip_cmd_m=grip_goal_m,
+        )
         rate.sleep()
 
 def main():
-    TASK_NAME = "piper_single_arm_quest3_real"
+    TASK_NAME = REPO_ID
     NUM_DEMO = 50
 
     # Quest3
     teleop = Quest3Teleop()
+
+    # quest3 thread
+    latest_quest3 = {"frame": None}
+
+    # piper thread
+    latest_piper = {"payload": None, "seq": 0}
+    cmd_lock = threading.Lock()
+    piper_th = None
+
+    # stop event
+    stop_event = threading.Event()
 
     # MuJoCo model for IK/FK internal
     model, data, configuration = initialize_model()
@@ -239,24 +291,26 @@ def main():
         obs = robot.get_observation()
         q_meas_deg = extract_qpos_deg_from_obs(obs)
         data.qpos[:6] = np.deg2rad(q_meas_deg)
+        grip_meas_norm = obs.get("gripper.pos", None)
+        grip_m = 0.0 if grip_meas_norm is None else float(np.clip(grip_meas_norm, 0.0, 1.0)) * 0.035
+        data.qpos[6] = grip_m
+        data.qpos[7] = -grip_m
         mujoco.mj_forward(model, data)
         configuration.update(data.qpos)
-        return q_meas_deg
 
     # episode logic
     episode_id = 0 # number of episodes
     record_flag = False
-    episode_frames = 0 # 
     prev_reset = False
     prev_done = False
 
     def hard_reset():
-        nonlocal record_flag, follow, rec_accum, episode_frames
-        episode_frames = 0
+        nonlocal record_flag, follow, rec_accum
         rec_accum = 0.0
 
         follow = Controller(use_rotation=True, pos_scale=1.0, R_fix=follow.R_fix)
 
+        clear_piper_cmd(latest_cmd=latest_piper, cmd_lock=cmd_lock)
         ## move to key frame
         if key_id != -1:
             print("[RESET] moving to keyframe 'home'...")
@@ -265,14 +319,13 @@ def main():
                 key_id=key_id,
                 robot=robot,
                 rate=rate,
-                tol_deg=HOME_REACH_TOL_DEG,
+                tol_arm_deg=HOME_REACH_TOL_DEG,
+                tol_gripper=0.003/0.035,  # 3mm -> norm
                 timeout_sec=HOME_TIMEOUT_SEC,
+                latest_cmd= latest_piper,
+                cmd_lock= cmd_lock,
             )
-            time.sleep(HOME_SETTLE_SEC)
-        try:
-            robot.send_action({"gripper.pos": 1.0})
-        except Exception as e:
-            print(f"[WARN] gripper open failed: {e}")
+            print("Home Settle Done")
         ## 
 
         sync_mujoco_from_measured()
@@ -287,23 +340,16 @@ def main():
 
     try:
         with mujoco.viewer.launch_passive(model=model, data=data, show_left_ui=False, show_right_ui=True) as viewer:
+            ## quest3 thread ##
+            quest3_th = start_teleop_thread(teleop=teleop, latest=latest_quest3, stop_event=stop_event, hz=100.0)
+            ## piper thread ##
+            piper_th = start_piper_thread(robot=robot, latest_cmd=latest_piper, cmd_lock=cmd_lock, stop_event=stop_event, hz=RATE_HZ)
+
             # hard reset for sending robot to keyframe pos
             hard_reset()
 
-            ## teleop ##
-            latest = {"frame": None}
-            stop_event = threading.Event()
-            def teleop_thread():
-                while not stop_event.is_set():
-                    latest["frame"] = teleop.read()
-                    time.sleep(0.01)
-
-            th = threading.Thread(target=teleop_thread, daemon=True)
-            th.start()
-            ##
-
             while viewer.is_running() and episode_id < NUM_DEMO:
-                frame = latest["frame"] # teleop frame
+                frame = latest_quest3["frame"] # teleop frame
                 if frame is None:
                     viewer.sync()
                     rate.sleep()
@@ -312,10 +358,12 @@ def main():
                 frame_dt = rate.dt
                 ik_dt = frame_dt / float(max(1, MAX_ITERS_PER_CYCLE))
 
-                q_meas_deg = sync_mujoco_from_measured()
+                # obs -> mujoco
+                sync_mujoco_from_measured()
 
                 # gripper
-                grip_cmd = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
+                grip_cmd_norm = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
+                grip_cmd_m = grip_cmd_norm * 0.035
 
                 # controller pose
                 T_ctrl = T_from_pos_quat_xyzw(frame.right_pose.pos, frame.right_pose.quat)
@@ -347,7 +395,7 @@ def main():
                 done = done_now and (not prev_done)
                 prev_done = done_now
                 if done:
-                    print(f"[DONE] button A pressed. record_flag={record_flag} frames={episode_frames}")
+                    print(f"[DONE] button A pressed. record_flag={record_flag}")
                     if record_flag:
                         dataset.save_episode()
                         episode_id += 1
@@ -364,10 +412,8 @@ def main():
                     vel = mink.solve_ik(configuration, tasks, ik_dt, SOLVER, DAMPING)
                     configuration.integrate_inplace(vel, ik_dt)
 
-                    # simulation is just for visualizing(physics are from real robot)
-                    # mujoco is updating every IK loop + getting robot pose from real robot
-                    data.qpos[:] = configuration.q
-                    mujoco.mj_forward(model, data) # step is for physics, forward is for fk+constraint
+                    data.qpos[:] = configuration.q # IK calculated value -> data
+                    mujoco.mj_forward(model, data) # FK -> EE pos update -> data
 
                     reached = check_reached_single(
                         model, data, site_id,
@@ -376,11 +422,10 @@ def main():
                     )
                     if reached:
                         break
-
+                
+                # IK calculated deg
                 q_cmd_deg = np.rad2deg(np.array(configuration.q, dtype=np.float64)[:6].copy())
-                q_cmd_deg = clamp_step_deg(q_meas_deg, q_cmd_deg, MAX_DQ_PER_STEP_DEG)
-
-                robot.send_action(q_cmd_deg, grip_cmd)
+                publish_piper_cmd(latest_cmd=latest_piper, cmd_lock=cmd_lock, q_cmd_deg=q_cmd_deg, grip_cmd_m=grip_cmd_m)
 
                 # -------- data collection --------
                 rec_accum += frame_dt
@@ -392,21 +437,21 @@ def main():
                     tquat = _vec1(data.mocap_quat[mocap_id])[:4]
                     target_state = np.concatenate([tpos, tquat], axis=0).astype(np.float32)
 
-                    action_qpos = np.deg2rad(q_cmd_deg).astype(np.float32)
-
+                    # arm 6, grip 2 
+                    arm_qpos = np.deg2rad(q_cmd_deg).astype(np.float32)
+                    grip_qpos = np.array([grip_cmd_m, -grip_cmd_m], dtype=np.float32)
+                    action_qpos = np.concatenate([arm_qpos, grip_qpos], axis=0)
+                                        
                     if record_flag:
                         frame_dict = {
                             "observation.state": obs_state,
                             "observation.target": target_state,
                             "action": action_qpos,
-                            "action.gripper": np.array([grip_cmd], dtype=np.float32),
                             "task": TASK_NAME,
                             "observation.front_image": DUMMY_FRONT,
                             "observation.wrist_image": DUMMY_WRIST
                         }
- 
                         dataset.add_frame(frame_dict)
-                        episode_frames += 1
                 # ---------------------------------------
                 viewer.sync()
                 rate.sleep()
@@ -414,11 +459,13 @@ def main():
     except KeyboardInterrupt:
         print("\n[INFO] KeyboardInterrupt")
     finally:
-        # stop threads first
+        # stop threads
         stop_event.set()
 
+        # quest3 thread
         try:
-            th.join(timeout=1.0)
+            quest3_th.join(timeout=1.0)
+            piper_th.join(timeout=1.0)
         except Exception:
             pass
 
@@ -426,18 +473,12 @@ def main():
         try:
             obs = robot.get_observation()
             q_hold_deg = extract_qpos_deg_from_obs(obs)
-            robot.send_action(q_hold_deg)
+            grip_hold_norm = obs.get("gripper.pos", 0.0)
+            grip_hold_norm = float(np.clip(float(grip_hold_norm), 0.0, 1.0)) if grip_hold_norm is not None else 0.0
+            robot.send_action(q_hold_deg, grip_hold_norm)
             print("[SAFE] sent hold action (measured posture).")
         except Exception as e:
             print(f"[WARN] failed to send hold action: {e}")
-
-        # save partial if any
-        try:
-            if record_flag and episode_frames > 0:
-                print("[INFO] Saving partial episode before exit.")
-                dataset.save_episode()
-        except Exception as e:
-            print(f"[WARN] failed to save partial episode: {e}")
 
         dataset.finalize()
 
