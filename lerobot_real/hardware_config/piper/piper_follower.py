@@ -102,6 +102,7 @@ class PiperFollower(Robot):
             logger.warning(f"[PIPER] MotionCtrl_2 re-apply failed: {e}")
         if calibrate:
             self.calibrate()
+
         logger.info(f"{self} connected.")
 
     def configure(self) -> None:

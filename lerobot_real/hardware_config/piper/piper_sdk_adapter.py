@@ -115,19 +115,12 @@ class PiperSdkAdapter:
     def is_enabled(self) -> bool:
         if not self.is_connected:
             return False
-        info = self.interface.GetArmLowSpdInfoMsgs()
-        if info is None:
-            return False
         try:
-            return (
-                info.motor_1.foc_status.driver_enable_status and
-                info.motor_2.foc_status.driver_enable_status and
-                info.motor_3.foc_status.driver_enable_status and
-                info.motor_4.foc_status.driver_enable_status and
-                info.motor_5.foc_status.driver_enable_status and
-                info.motor_6.foc_status.driver_enable_status
-            )
-        except AttributeError:
+            status = self.interface.GetArmEnableStatus()
+            logger.info(f"[PIPER] enable status = {status}")
+            return all(status)
+        except Exception as e:
+            logger.warning(f"[PIPER] GetArmEnableStatus failed: {e}")
             return False
 
     # ---- torque(enable/disable) ----

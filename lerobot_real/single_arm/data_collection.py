@@ -93,12 +93,12 @@ def make_or_load_dataset(*, model: mujoco.MjModel) -> LeRobotDataset:
     create_new = not (dataset_root / "meta").exists()
 
     features = {
-        "observation.front_image": {
+        "observation.front_image": { # front cam
             "dtype": "image",
             "shape": (IMG_H, IMG_W, 3),
             "names": ["height", "width", "channels"],
         },
-        "observation.wrist_image": {
+        "observation.wrist_image": { # wrist cam
             "dtype": "image",
             "shape": (IMG_H, IMG_W, 3),
             "names": ["height", "width", "channels"],
@@ -281,6 +281,9 @@ def main():
     robot = PiperFollower(piper_cfg)
     robot.connect(calibrate=False)
 
+    print("robot connected state:", getattr(robot, "is_connected", "NO_ATTR"))
+    print("bus connected state:", getattr(robot.bus, "is_connected", "NO_ATTR"))    
+
     rate = RateLimiter(frequency=RATE_HZ, warn=False)
     rec_accum = 0.0
 
@@ -362,7 +365,7 @@ def main():
                 sync_mujoco_from_measured()
 
                 # gripper
-                grip_cmd_norm = float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
+                grip_cmd_norm = 1.0 - float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
                 grip_cmd_m = grip_cmd_norm * 0.035
 
                 # controller pose

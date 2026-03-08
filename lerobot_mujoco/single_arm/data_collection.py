@@ -60,7 +60,7 @@ R_SWAP_XZ = np.array([
     [1.0, 0.0, 0.0],
 ], dtype=np.float64)
 
-# 부호 교정
+# sign fix
 R_FLIP_RP = np.array([
     [-1.0,  0.0,  0.0],
     [ 0.0,  1.0,  0.0],
