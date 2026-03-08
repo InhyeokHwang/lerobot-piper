@@ -5,6 +5,7 @@ numpy
 
 pytransform3d
 vuer
+opencv-python
 
 # --- Core numerical stack ---
 numpy

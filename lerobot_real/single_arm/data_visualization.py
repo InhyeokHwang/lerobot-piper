@@ -7,11 +7,11 @@ import mujoco
 import mujoco.viewer
 import mink
 import numpy as np
+import cv2
 from loop_rate_limiters import RateLimiter
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from mink_ik.single_arm_mink_ik import pick_ee_site, initialize_model
-
 
 def _vec1(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
@@ -28,11 +28,10 @@ def set_mocap_target_from_target_state(
     data.mocap_pos[mocap_id] = pos
     data.mocap_quat[mocap_id] = quat
 
-
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--root", type=str, default=str((Path(__file__).resolve().parent / "demo_data").resolve()))
-    p.add_argument("--repo_id", type=str, default="piper_single_arm_teleop")
+    p.add_argument("--repo_id", type=str, default="piper_single_arm_teleop_real")
     p.add_argument("--episode", type=int, default=0)
     p.add_argument("--hz", type=float, default=20.0)
     p.add_argument("--loop", action="store_true")
@@ -82,6 +81,9 @@ def main():
 
     rate = RateLimiter(frequency=float(args.hz), warn=False)
 
+    cv2.namedWindow("front_cam")
+    cv2.namedWindow("wrist_cam")
+
     with mujoco.viewer.launch_passive(
         model=model,
         data=data,
@@ -92,7 +94,7 @@ def main():
 
         i = 0
         while viewer.is_running():
-            row = hf[int(indices[i])]  # dict-like
+            row = ds[int(indices[i])]  # dict-like
 
             if "action" in row and row["action"] is not None:
                 qpos = _vec1(row["action"])
@@ -108,6 +110,49 @@ def main():
                 except Exception as e:
                     print(f"[VIS][WARN] target update failed at i={i}: {type(e).__name__}: {e}")
 
+            # ---------- camera display ----------
+            if "observation.front_image" in row:
+                front = row["observation.front_image"]
+                if front is not None:
+                    if hasattr(front, "cpu"):  
+                        front = front.cpu().numpy()
+                    else:
+                        front = np.asarray(front)
+
+                    if front.ndim == 3 and front.shape[0] == 3:
+                        front = np.transpose(front, (1, 2, 0))
+
+                    if np.issubdtype(front.dtype, np.floating):
+                        if front.max() <= 1.0:
+                            front = (front * 255.0).clip(0, 255)
+                        else:
+                            front = front.clip(0, 255)
+
+                    front = np.ascontiguousarray(front).astype(np.uint8)
+                    cv2.imshow("front_cam", cv2.cvtColor(front, cv2.COLOR_RGB2BGR))
+
+            if "observation.wrist_image" in row:
+                wrist = row["observation.wrist_image"]
+                if wrist is not None:
+                    if hasattr(wrist, "cpu"):
+                        wrist = wrist.cpu().numpy()
+                    else:
+                        wrist = np.asarray(wrist)
+
+                    if wrist.ndim == 3 and wrist.shape[0] == 3:
+                        wrist = np.transpose(wrist, (1, 2, 0))
+
+                    if np.issubdtype(wrist.dtype, np.floating):
+                        if wrist.max() <= 1.0:
+                            wrist = (wrist * 255.0).clip(0, 255)
+                        else:
+                            wrist = wrist.clip(0, 255)
+
+                    wrist = np.ascontiguousarray(wrist).astype(np.uint8)
+                    cv2.imshow("wrist_cam", cv2.cvtColor(wrist, cv2.COLOR_RGB2BGR))
+            cv2.waitKey(1)
+            # ------------------------------------
+
             mujoco.mj_forward(model, data)
             viewer.sync()
             rate.sleep()
@@ -119,7 +164,7 @@ def main():
                 else:
                     print("[VIS] Done.")
                     break
-
+    cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()

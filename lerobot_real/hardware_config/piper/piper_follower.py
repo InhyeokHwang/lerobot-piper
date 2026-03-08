@@ -18,14 +18,7 @@ from .piper_bus import PiperMotorsBus
 
 logger = logging.getLogger(__name__)
 
-
 class PiperFollower(Robot):
-    """
-    Piper follower robot.
-    - Piper SDK가 제공하는 "절대각(deg)"을 그대로 사용
-    - LeRobot의 MotorCalibration(half-turn homing / range recording) 절차는 사용하지 않음
-    """
-
     config_class = PiperRobotConfig
     name = "piper_follower"
 
@@ -47,11 +40,6 @@ class PiperFollower(Robot):
 
     @property
     def _motors_ft(self) -> dict[str, type]:
-        """
-        Observation motor features.
-        - 기본: pos
-        - 가능하면 vel/torque도 포함 (bus가 지원할 때)
-        """
         features: dict[str, type] = {}
         for motor in self.bus.motors:
             features[f"{motor}.pos"] = float
@@ -109,7 +97,7 @@ class PiperFollower(Robot):
         self.bus.configure_motors()
 
     @check_if_not_connected
-    def get_observation(self) -> RobotObservation:
+    def get_observation(self) -> RobotObservation: # only for robot joints and gripper
         start = time.perf_counter()
 
         states = self.bus.sync_read_all_states()
@@ -132,12 +120,15 @@ class PiperFollower(Robot):
         except Exception:
             pass
 
-        # cameras
-        for cam_key, cam in self.cameras.items():
-            obs[cam_key] = cam.async_read()
-
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} get_observation: {dt_ms:.1f}ms")
+        return obs
+    
+    @check_if_not_connected
+    def get_camera_frames(self) -> dict[str, Any]: # camera obs
+        obs: dict[str, Any] = {}
+        for cam_key, cam in self.cameras.items():
+            obs[cam_key] = cam.async_read()
         return obs
     
     def _gripper_norm_to_mm(self, g: float) -> float:

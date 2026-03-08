@@ -31,7 +31,10 @@ from mink_ik.quest3_utils import (
 
 from quest3.quest3_thread import start_teleop_thread
 from lerobot_real.hardware_config.piper.piper_thread import start_piper_thread, publish_piper_cmd, clear_piper_cmd
-
+from lerobot_real.hardware_config.camera.camera_thread import start_cam_thread
+from queue import Queue, Full
+from lerobot_real.hardware_config.camera.dataset_writer_thread import start_dataset_writer_thread
+from lerobot_real.hardware_config.piper.obs_thread import start_obs_thread, get_latest_obs_copy
 from lerobot_real.hardware_config.piper.piper_config import PiperRobotConfig
 from lerobot_real.hardware_config.piper.piper_follower import PiperFollower
 
@@ -43,14 +46,14 @@ POSTURE_COST = 1e-3
 MAX_ITERS_PER_CYCLE = 20
 DAMPING = 1e-3
 
-POS_THRESHOLD = 1e-4
-ORI_THRESHOLD = 1e-4
+POS_THRESHOLD = 1e-2   # 1 cm
+ORI_THRESHOLD = 2e-2   # 1.1 deg
 
 # Control loop rate
-RATE_HZ = 50.0
+RATE_HZ = 100.0
 
 # Data collection rate
-REC_HZ = 20.0
+REC_HZ = 15.0
 REC_DT = 1.0 / REC_HZ
 
 HOME_REACH_TOL_DEG = 1.5
@@ -81,9 +84,8 @@ REPO_ID = "piper_single_arm_teleop_real"
 DATASET_HOME = (_HERE / "demo_data").resolve()
 FPS = int(REC_HZ)
 
-IMG_H, IMG_W = 256, 256 
-DUMMY_FRONT = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
-DUMMY_WRIST = np.zeros((IMG_H, IMG_W, 3), dtype=np.uint8)
+IMG_W = 640 
+IMG_H = 480
 
 def _vec1(x) -> np.ndarray:
     return np.asarray(x, dtype=np.float64).reshape(-1)
@@ -237,14 +239,6 @@ def main():
     # Quest3
     teleop = Quest3Teleop()
 
-    # quest3 thread
-    latest_quest3 = {"frame": None}
-
-    # piper thread
-    latest_piper = {"payload": None, "seq": 0}
-    cmd_lock = threading.Lock()
-    piper_th = None
-
     # stop event
     stop_event = threading.Event()
 
@@ -253,6 +247,25 @@ def main():
 
     # dataset
     dataset = make_or_load_dataset(model=model)
+
+    ### threads ###
+    # quest3 thread
+    latest_quest3 = {"frame": None}
+    # piper thread
+    latest_piper = {"payload": None, "seq": 0}
+    cmd_lock = threading.Lock()
+    piper_th = None
+    # camera thread
+    latest_cams = {"front_cam": None, "wrist_cam": None, "stamp": 0.0, "seq": 0}
+    cam_lock = threading.Lock()
+    cam_th = None
+    # writer thread
+    write_queue = Queue(maxsize=128)
+    writer_th = None
+    # obs thread
+    latest_obs = {"obs": None, "stamp": 0.0, "seq": 0}
+    obs_lock = threading.Lock()
+    obs_th = None
 
     # keyframe home
     key_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
@@ -290,8 +303,7 @@ def main():
     follow = Controller(use_rotation=True, pos_scale=1.0, R_fix=np.eye(3))
 
     # hw -> mujoco sync
-    def sync_mujoco_from_measured():
-        obs = robot.get_observation()
+    def sync_mujoco_from_measured(obs: Dict):
         q_meas_deg = extract_qpos_deg_from_obs(obs)
         data.qpos[:6] = np.deg2rad(q_meas_deg)
         grip_meas_norm = obs.get("gripper.pos", None)
@@ -309,7 +321,10 @@ def main():
 
     def hard_reset():
         nonlocal record_flag, follow, rec_accum
+        record_flag = False
         rec_accum = 0.0
+
+        write_queue.join() # flush queue
 
         follow = Controller(use_rotation=True, pos_scale=1.0, R_fix=follow.R_fix)
 
@@ -331,14 +346,17 @@ def main():
             print("Home Settle Done")
         ## 
 
-        sync_mujoco_from_measured()
+        obs = get_latest_obs_copy(latest_obs, obs_lock)
+
+        if obs is not None:
+            sync_mujoco_from_measured(obs)
+
         posture_task.set_target_from_configuration(configuration)
         
         mink.move_mocap_to_frame(model, data, "target", ee_site, "site")
         mujoco.mj_forward(model, data)
 
         dataset.clear_episode_buffer()
-        record_flag = False
         print("[RESET] env + episode buffer cleared")
 
     try:
@@ -347,7 +365,13 @@ def main():
             quest3_th = start_teleop_thread(teleop=teleop, latest=latest_quest3, stop_event=stop_event, hz=100.0)
             ## piper thread ##
             piper_th = start_piper_thread(robot=robot, latest_cmd=latest_piper, cmd_lock=cmd_lock, stop_event=stop_event, hz=RATE_HZ)
-
+            ## camera thread ##
+            cam_th = start_cam_thread(robot=robot, latest_cams=latest_cams, cam_lock=cam_lock, stop_event=stop_event, hz=15.0)
+            ## writer thread ##
+            writer_th = start_dataset_writer_thread(dataset=dataset, write_queue=write_queue, stop_event=stop_event)
+            ## obs thread ##
+            obs_th = start_obs_thread(robot=robot, latest_obs=latest_obs, obs_lock=obs_lock, stop_event=stop_event, hz=RATE_HZ)
+            
             # hard reset for sending robot to keyframe pos
             hard_reset()
 
@@ -362,7 +386,9 @@ def main():
                 ik_dt = frame_dt / float(max(1, MAX_ITERS_PER_CYCLE))
 
                 # obs -> mujoco
-                sync_mujoco_from_measured()
+                obs = get_latest_obs_copy(latest_obs, obs_lock)# camera should not block control loop -> separate
+                if obs is not None:
+                    sync_mujoco_from_measured(obs)
 
                 # gripper
                 grip_cmd_norm = 1.0 - float(np.clip(float(frame.right_state.trigger), 0.0, 1.0))
@@ -400,6 +426,7 @@ def main():
                 if done:
                     print(f"[DONE] button A pressed. record_flag={record_flag}")
                     if record_flag:
+                        write_queue.join() # flush queue
                         dataset.save_episode()
                         episode_id += 1
                         print(f"[DATASET] Episode saved. episode_id={episode_id}/{NUM_DEMO}")
@@ -446,15 +473,28 @@ def main():
                     action_qpos = np.concatenate([arm_qpos, grip_qpos], axis=0)
                                         
                     if record_flag:
-                        frame_dict = {
-                            "observation.state": obs_state,
-                            "observation.target": target_state,
-                            "action": action_qpos,
-                            "task": TASK_NAME,
-                            "observation.front_image": DUMMY_FRONT,
-                            "observation.wrist_image": DUMMY_WRIST
-                        }
-                        dataset.add_frame(frame_dict)
+                        front_img = None
+                        wrist_img = None
+                        with cam_lock:
+                            if latest_cams["front_cam"] is not None:
+                                front_img = latest_cams["front_cam"].copy()
+                            if latest_cams["wrist_cam"] is not None:
+                                wrist_img = latest_cams["wrist_cam"].copy()
+
+                        if front_img is not None and wrist_img is not None:
+                            frame_dict = {
+                                "observation.state": obs_state,
+                                "observation.target": target_state,
+                                "action": action_qpos,
+                                "task": TASK_NAME,
+                                "observation.front_image": front_img,
+                                "observation.wrist_image": wrist_img,
+                            }
+                            # put into queue 
+                            try:
+                                write_queue.put_nowait(frame_dict)
+                            except Full:
+                                print("[WRITE][DROP] queue full, dropping frame")
                 # ---------------------------------------
                 viewer.sync()
                 rate.sleep()
@@ -465,23 +505,28 @@ def main():
         # stop threads
         stop_event.set()
 
-        # quest3 thread
+        # thread
         try:
             quest3_th.join(timeout=1.0)
             piper_th.join(timeout=1.0)
+            cam_th.join(timeout=1.0)
+            write_queue.join()
+            writer_th.join(timeout=1.0)
+            obs_th.join(timeout=1.0)
         except Exception:
             pass
 
-        # safe hold
+        # all zero
         try:
-            obs = robot.get_observation()
-            q_hold_deg = extract_qpos_deg_from_obs(obs)
-            grip_hold_norm = obs.get("gripper.pos", 0.0)
-            grip_hold_norm = float(np.clip(float(grip_hold_norm), 0.0, 1.0)) if grip_hold_norm is not None else 0.0
-            robot.send_action(q_hold_deg, grip_hold_norm)
-            print("[SAFE] sent hold action (measured posture).")
+            time.sleep(1.0)#wait
+            q_zero_deg = np.zeros(6, dtype=np.float64)
+            grip_zero_norm = 0.0
+
+            robot.send_action(q_zero_deg, grip_zero_norm)
+            print("[SAFE] sent zero-pose command.")
+            time.sleep(3.0)# wait
         except Exception as e:
-            print(f"[WARN] failed to send hold action: {e}")
+            print(f"[WARN] failed to send zero-pose command: {e}")
 
         dataset.finalize()
 
