@@ -6,6 +6,7 @@ __pycache__/
 /ckpt/
 /lerobot_mujoco/single_arm/demo_data/
 /lerobot_mujoco/bimanual/demo_data/
+/lerobot_real/single_arm/demo_data/
 
 # Quest3 TLS certs 
 quest3/cert.pem
