@@ -74,7 +74,7 @@ python train_act.py \
   --num_workers 4 \
   --lr 1e-4 \
   --steps 5000 \
-  --device cuda```
+  --device cuda
 ```
 #### 4. deploy
 ```bash
